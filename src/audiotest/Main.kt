@@ -9,6 +9,9 @@ import kotlin.math.sqrt
 
 const val SAMPLE_SIZE = 1024
 
+const val AUTOFLUSH = true
+const val AUTOFLUSH_INTERVAL = 10 * 60 * 1000L   //10 minutes
+
 fun main() {
     //Get all audio input devices.
     val inputs = AudioInput.getAudioInputs()
@@ -68,14 +71,23 @@ fun main() {
         var output: Boolean = true
 
         private val dataAsInts = IntArray(SAMPLE_SIZE * inputFormat.channels)
+        private val converter = ByteToIntConverter(inputFormat)
+
+        private var nextAutoFlush = System.currentTimeMillis() + AUTOFLUSH_INTERVAL
 
         override fun audioFrameCaptured(data: ByteArray) {
             if (output) {
                 //Calculate and print the RMS value of the captured audio samples.
-                bytesToInts(data, inputFormat, dataAsInts)
+                converter.bytesToInts(data, dataAsInts)
                 val quadraticSum = dataAsInts.sumByDouble { it.toDouble() * it.toDouble() }
                 val rms = sqrt(quadraticSum / dataAsInts.size)
                 println("RMS: $rms")
+            }
+
+            if (AUTOFLUSH && nextAutoFlush <= System.currentTimeMillis()) {
+                println("Auto flushing audio input...")
+                input.flush()
+                nextAutoFlush = System.currentTimeMillis() + AUTOFLUSH_INTERVAL
             }
         }
     }
@@ -123,38 +135,39 @@ fun main() {
     input.close()
 }
 
-/**
- * Converts some given data in the form of a byte array to an integer array representing the same data.
- *
- * @param data The byte array containing the data to transform.
- * @param format the [AudioFormat] of the given [data].
- * @param result the array in which the result should be stored.
- */
-private fun bytesToInts(data: ByteArray, format: AudioFormat, result: IntArray) {
+class ByteToIntConverter(format: AudioFormat) {
     //Determine the amount of bytes per integer, the byte order and the offset for the conversion.
-    val bytesPerInt = ceil(format.sampleSizeInBits.toFloat() / 8.0f).toInt()
-    val order = if (format.isBigEndian) ByteOrder.BIG_ENDIAN else ByteOrder.LITTLE_ENDIAN
-    val srcPos = if (format.isBigEndian) 4 - bytesPerInt else 0
+    private val bytesPerInt = ceil(format.sampleSizeInBits.toFloat() / 8.0f).toInt()
+    private val order = if (format.isBigEndian) ByteOrder.BIG_ENDIAN else ByteOrder.LITTLE_ENDIAN
+    private val srcPos = if (format.isBigEndian) 4 - bytesPerInt else 0
 
     //Determine the formula to use for getting the most significant (i.e. highest order) byte of a number.
-    val getHighestByte = if (format.isBigEndian)
+    private val getHighestByte = if (format.isBigEndian)
         { intIndex: Int -> intIndex * bytesPerInt }
     else
         { intIndex: Int -> (intIndex + 1) * bytesPerInt - 1 }
-    val signed = format.encoding == AudioFormat.Encoding.PCM_SIGNED
+    private val signed = format.encoding == AudioFormat.Encoding.PCM_SIGNED
 
-    //Perform the actual conversion.
-    for (i in 0 until data.size / bytesPerInt) {
-        //Determine if the highest bit of the is set.
-        val highestBit = data[getHighestByte(i)].toInt() and 0x80 != 0
+    //Create a buffer for converting exactly four bytes into an integer.
+    private val localBytes = ByteArray(4)
+    private val byteBuffer = ByteBuffer.wrap(localBytes).order(order)
 
-        //Create exactly four bytes that represent the same number.
-        val localBytes = ByteArray(4,
-            if (highestBit && signed) { _ -> 0xFF.toByte() } else { _ -> 0x00.toByte() })
-        for (j in 0 until bytesPerInt)
-            localBytes[srcPos + j] = data[i * bytesPerInt + j]
+    fun bytesToInts(data: ByteArray, result: IntArray) {
+        //Perform the actual conversion.
+        for (i in 0 until data.size / bytesPerInt) {
+            //Determine if the highest bit of the is set.
+            val highestBit = data[getHighestByte(i)].toInt() and 0x80 != 0
 
-        //Convert the four bytes into an integer.
-        result[i] = ByteBuffer.wrap(localBytes).order(order).int
+            //Create exactly four bytes that represent the same number.
+            val initialValue = if (highestBit && signed) 0xFF.toByte() else 0x00.toByte()
+            for (j in 0 until 4)
+                localBytes[j] = initialValue
+            for (j in 0 until bytesPerInt)
+                localBytes[srcPos + j] = data[i * bytesPerInt + j]
+
+            //Convert the four bytes into an integer.
+            byteBuffer.position(0)
+            result[i] = byteBuffer.int
+        }
     }
 }
